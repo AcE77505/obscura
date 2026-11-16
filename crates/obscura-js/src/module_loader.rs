@@ -101,10 +101,8 @@ pub struct ObscuraModuleLoader {
     /// "fetching" state that makes later requests wait for the first one.
     /// Entries are weak: the waiting loads own the fetch, so a fetch whose
     /// loads were all cancelled is dropped (and reported as failed) as before.
-    /// Every waiting load hands the source to deno_core, which registers the
-    /// module before polling anything else, so once the last one has taken it
-    /// later loads find the module in deno_core's map. A failed fetch is not
-    /// cached: a later request fetches it again.
+    /// Fetch completion or cancellation removes its own entry without
+    /// scanning other pending requests. Failed fetches are not cached.
     inflight: Rc<RefCell<HashMap<String, WeakShared<ModuleFetch>>>>,
 }
 
@@ -116,6 +114,19 @@ struct FetchedModule {
 }
 
 type ModuleFetch = LocalBoxFuture<'static, Result<FetchedModule, String>>;
+
+struct InflightFetchGuard {
+    inflight: Weak<RefCell<HashMap<String, WeakShared<ModuleFetch>>>>,
+    url: String,
+}
+
+impl Drop for InflightFetchGuard {
+    fn drop(&mut self) {
+        if let Some(inflight) = self.inflight.upgrade() {
+            inflight.borrow_mut().remove(&self.url);
+        }
+    }
+}
 
 impl ObscuraModuleLoader {
     pub fn new(base_url: &str) -> Self {
@@ -287,15 +298,20 @@ impl ModuleLoader for ObscuraModuleLoader {
         let requested_specifier = module_specifier.clone();
         let fetch = {
             let mut inflight = self.inflight.borrow_mut();
-            inflight.retain(|_, fetch| fetch.upgrade().is_some());
             match inflight.get(&url).and_then(WeakShared::upgrade) {
                 Some(fetch) => fetch,
                 None => {
                     let page_network = self.page_network();
-                    let fetch = fetch_module(
-                        url.clone(), proxy_url, document_url, referrer, page_state, page_network,
-                    )
-                    .map(|result| result.map_err(|error| error.to_string()))
+                    let cleanup = InflightFetchGuard {
+                        inflight: Rc::downgrade(&self.inflight),
+                        url: url.clone(),
+                    };
+                    let fetch_url = url.clone();
+                    let fetch = async move {
+                        let _cleanup = cleanup;
+                        fetch_module(fetch_url, proxy_url, document_url, referrer,
+                            page_state, page_network).await.map_err(|error| error.to_string())
+                    }
                     .boxed_local()
                     .shared();
                     if let Some(weak) = fetch.downgrade() {
@@ -452,5 +468,124 @@ async fn fetch_module(
             Ok(FetchedModule { found, code: Arc::from(code) })
         }
         Err(error) => Err(io_err(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_load(loader: &ObscuraModuleLoader, url: &str) -> ModuleLoadResponse {
+        loader.load(&ModuleSpecifier::parse(url).unwrap(), None, ModuleLoadOptions {
+            is_dynamic_import: true,
+            is_synchronous: false,
+            requested_module_type: deno_core::RequestedModuleType::None,
+        })
+    }
+
+    #[test]
+    fn cancelled_module_loads_release_inflight_entries_without_another_request() {
+        let loader = ObscuraModuleLoader::new("https://example.com/");
+        let first = pending_load(&loader, "https://example.com/shared.js");
+        let second = pending_load(&loader, "https://example.com/shared.js");
+        assert_eq!(loader.inflight.borrow().len(), 1);
+        drop(first);
+        assert_eq!(loader.inflight.borrow().len(), 1, "another graph still owns the fetch");
+        drop(second);
+        assert!(loader.inflight.borrow().is_empty(), "cancelled URLs must not remain in the map");
+        assert!(!loader.activity.is_pending_or_recent(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn cancelling_large_module_fanout_clears_all_entries() {
+        for count in [1_000, 4_000, 8_000] {
+            let loader = ObscuraModuleLoader::new("https://example.com/");
+            let start = std::time::Instant::now();
+            let loads: Vec<_> = (0..count).map(|index| {
+                pending_load(&loader, &format!("https://example.com/{index}.js"))
+            }).collect();
+            eprintln!("{count} pending module loads: {:?}", start.elapsed());
+            assert_eq!(loader.inflight.borrow().len(), count);
+            drop(loads);
+            assert!(loader.inflight.borrow().is_empty());
+        }
+    }
+
+    fn network_loader(base: &str) -> ObscuraModuleLoader {
+        let mut loader = ObscuraModuleLoader::new(base);
+        loader.standalone_client = Some(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        loader
+    }
+
+    fn async_load(loader: &ObscuraModuleLoader, url: &str) -> Pin<Box<deno_core::ModuleSourceFuture>> {
+        match pending_load(loader, url) {
+            ModuleLoadResponse::Async(load) => load,
+            ModuleLoadResponse::Sync(_) => panic!("network loads must be asynchronous"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_failed_module_fetch_can_be_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/shared.js", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).await.unwrap();
+                let body = "export const value = 42;";
+                stream.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let loader = network_loader(&url);
+        let (first, second) = tokio::join!(async_load(&loader, &url), async_load(&loader, &url));
+        for result in [first, second] {
+            let Err(error) = result else { panic!("HTTP failure must reach every waiter") };
+            assert!(error.to_string().contains("HTTP 503"), "{error}");
+        }
+        assert!(loader.inflight.borrow().is_empty());
+        assert!(async_load(&loader, &url).await.is_ok(), "a failure must not poison future loads");
+        assert!(loader.inflight.borrow().is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_one_active_module_waiter_keeps_the_shared_fetch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/shared.js", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let body = "export const value = 42;";
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let loader = network_loader(&url);
+        let mut first = async_load(&loader, &url);
+        let second = async_load(&loader, &url);
+        tokio::select! {
+            result = &mut first => panic!("held response completed: {}", result.is_ok()),
+            result = started_rx => result.unwrap(),
+        }
+        drop(first);
+        assert_eq!(loader.inflight.borrow().len(), 1);
+        release_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), second).await.unwrap().is_ok());
+        assert!(loader.inflight.borrow().is_empty());
+        server.await.unwrap();
     }
 }
