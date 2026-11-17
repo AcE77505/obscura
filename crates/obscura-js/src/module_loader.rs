@@ -101,8 +101,8 @@ pub struct ObscuraModuleLoader {
     /// "fetching" state that makes later requests wait for the first one.
     /// Entries are weak: the waiting loads own the fetch, so a fetch whose
     /// loads were all cancelled is dropped (and reported as failed) as before.
-    /// Fetch completion or cancellation removes its own entry without
-    /// scanning other pending requests. Failed fetches are not cached.
+    /// Once the last waiter completes or cancels, its entry is removed
+    /// without scanning other requests. Failed fetches are not cached.
     inflight: Rc<RefCell<HashMap<String, WeakShared<ModuleFetch>>>>,
 }
 
@@ -113,7 +113,7 @@ struct FetchedModule {
     code: Arc<str>,
 }
 
-type ModuleFetch = LocalBoxFuture<'static, Result<FetchedModule, String>>;
+type ModuleFetch = LocalBoxFuture<'static, (Result<FetchedModule, String>, Rc<InflightFetchGuard>)>;
 
 struct InflightFetchGuard {
     inflight: Weak<RefCell<HashMap<String, WeakShared<ModuleFetch>>>>,
@@ -302,15 +302,15 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Some(fetch) => fetch,
                 None => {
                     let page_network = self.page_network();
-                    let cleanup = InflightFetchGuard {
+                    let cleanup = Rc::new(InflightFetchGuard {
                         inflight: Rc::downgrade(&self.inflight),
                         url: url.clone(),
-                    };
+                    });
                     let fetch_url = url.clone();
                     let fetch = async move {
-                        let _cleanup = cleanup;
-                        fetch_module(fetch_url, proxy_url, document_url, referrer,
-                            page_state, page_network).await.map_err(|error| error.to_string())
+                        let fetched = fetch_module(fetch_url, proxy_url, document_url, referrer,
+                            page_state, page_network).await.map_err(|error| error.to_string());
+                        (fetched, cleanup)
                     }
                     .boxed_local()
                     .shared();
@@ -327,7 +327,8 @@ impl ModuleLoader for ObscuraModuleLoader {
             // the recursive graph, so this excludes parser-discovered/static
             // graphs without losing descendant fetches of a lazy graph.
             let _activity_guard = activity_guard;
-            let fetched = fetch.await.map_err(io_err)?;
+            let (fetched, _cleanup) = fetch.await;
+            let fetched = fetched.map_err(io_err)?;
             if fetched.found.as_str() != requested_specifier.as_str() {
                 loaded_specifiers.borrow_mut().push(fetched.found.to_string());
             }
@@ -584,7 +585,11 @@ mod tests {
         drop(first);
         assert_eq!(loader.inflight.borrow().len(), 1);
         release_tx.send(()).unwrap();
+        let third = async_load(&loader, &url);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(2), second).await.unwrap().is_ok());
+        assert_eq!(loader.inflight.borrow().len(), 1, "an unpolled waiter still owns the completed result");
+        assert!(async_load(&loader, &url).await.is_ok(), "late waiters must reuse the completed result");
+        assert!(third.await.is_ok());
         assert!(loader.inflight.borrow().is_empty());
         server.await.unwrap();
     }
