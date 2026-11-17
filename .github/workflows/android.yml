@@ -1,0 +1,136 @@
+name: Android build
+
+on:
+  workflow_dispatch:
+    inputs:
+      obscura_ref:
+        description: Upstream obscura ref
+        required: false
+        default: v0.2.7
+      features:
+        description: Cargo features
+        required: false
+        default: render,stealth
+  push:
+    branches: [android]
+    tags: ['android-v*']
+
+permissions:
+  contents: read
+
+env:
+  OBSCURA_REF: ${{ inputs.obscura_ref || 'v0.2.7' }}
+  FEATURES: ${{ inputs.features || 'render,stealth' }}
+
+jobs:
+  snapshot:
+    name: snapshot ${{ matrix.abi }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            os: ubuntu-24.04-arm
+          - abi: x86_64
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: h4ckf0r0day/obscura
+          ref: ${{ env.OBSCURA_REF }}
+          path: upstream
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev golang-go ninja-build
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build obscura-js natively
+        working-directory: upstream
+        run: |
+          export LIBCLANG_PATH="$(llvm-config --libdir)"
+          cargo build --release -p obscura-js
+      - name: Collect snapshot
+        run: |
+          set -euo pipefail
+          SNAP=$(find upstream/target/release/build \
+            -path '*obscura-js*/out/OBSCURA_SNAPSHOT.bin' \
+            -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+          test -s "$SNAP"
+          mkdir -p dist
+          cp "$SNAP" "dist/obscura-snapshot-${{ matrix.abi }}.bin"
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-${{ matrix.abi }}
+          path: dist/obscura-snapshot-${{ matrix.abi }}.bin
+          if-no-files-found: error
+
+  build:
+    name: build ${{ matrix.abi }}
+    needs: snapshot
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+          - abi: x86_64
+            target: x86_64-linux-android
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev golang-go python3 curl unzip ninja-build
+          LIBCLANG_DIR="$(llvm-config --libdir)"
+          echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> "$GITHUB_ENV"
+      - name: Set up Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          sudo unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-r26d" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: snapshot-${{ matrix.abi }}
+          path: android/snapshots
+      - name: Build
+        run: |
+          chmod +x android/*.sh
+          ./android/build.sh --abi ${{ matrix.abi }} --features "$FEATURES"
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "android/dist/${{ matrix.abi }}/libobscura.so" "dist/libobscura-${{ matrix.abi }}.so"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obscura-${{ matrix.abi }}
+          path: dist/libobscura-${{ matrix.abi }}.so
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    needs: [snapshot, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          sha256sum * > SHA256SUMS
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            libobscura-*.so
+            obscura-snapshot-*.bin
+            SHA256SUMS
